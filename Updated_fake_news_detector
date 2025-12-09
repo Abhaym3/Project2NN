@@ -1,0 +1,787 @@
+"""
+Fake News Detection using LSTM/GRU Neural Network
+This script implements a deep learning model to classify fake vs real news articles.
+"""
+
+import pandas as pd
+import numpy as np
+import re
+import pickle
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import (
+    Embedding,
+    LSTM,
+    GRU,
+    Dense,
+    Dropout,
+    Bidirectional,
+    SpatialDropout1D,
+    Conv1D,
+    GlobalMaxPooling1D,
+    MaxPooling1D,
+    GaussianNoise,
+)
+from tensorflow.keras import regularizers, constraints
+from tensorflow.keras.metrics import AUC
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+
+# Download NLTK data (run once)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
+
+# Set random seeds for reproducibility
+import os
+import sys
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configure TensorFlow - Allow GPU usage
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress INFO messages, show warnings
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # Allow GPU memory growth
+
+np.random.seed(42)
+
+# Import TensorFlow
+import tensorflow as tf
+
+# Configure GPU memory growth (prevents TensorFlow from allocating all GPU memory)
+try:
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+        print("="*60)
+        print("GPU DETECTED AND CONFIGURED")
+        print("="*60)
+        print(f"TensorFlow version: {tf.__version__}")
+        print(f"GPU devices: {[d.name for d in tf.config.list_physical_devices('GPU')]}")
+        print("="*60)
+    else:
+        print("="*60)
+        print("NO GPU DETECTED - Using CPU")
+        print("="*60)
+        print(f"TensorFlow version: {tf.__version__}")
+        print(f"CPU devices: {[d.name for d in tf.config.list_physical_devices('CPU')]}")
+        print("="*60)
+except Exception as e:
+    print(f"GPU configuration warning: {e}")
+    print("Continuing with default device configuration...")
+
+tf.random.set_seed(42)
+
+# Configuration
+# Very aggressive settings to prevent overfitting
+MAX_SEQUENCE_LENGTH = 150  # Further reduced
+MAX_NB_WORDS = 5000  # Much smaller vocabulary
+EMBEDDING_DIM = 32  # Very small embedding dimension
+LSTM_UNITS = 16  # Very small model
+GRU_UNITS = 16  # Very small model
+BATCH_SIZE = 32  # Smaller batches
+EPOCHS = 2 # More epochs with aggressive early stopping
+VALIDATION_SPLIT = 0.2  # Even larger validation set (20%)
+TEST_SPLIT = 0.2  # Even larger test set (20%)
+
+# Anti-overfitting: Use subset of data
+USE_DATA_SUBSET = True  # Enable to use only subset of training data
+DATA_SUBSET_RATIO = 0.5  # Use only 50% of training data (prevents memorization)
+
+def load_data():
+    """Load and combine fake and true news datasets"""
+    print("\n" + "="*60)
+    print("STEP 1: Loading datasets...")
+    print("="*60)
+    
+    # Load fake news with proper CSV handling
+    print("Loading Fake.csv...")
+    try:
+        # Try with newer pandas syntax first
+        try:
+            fake_df = pd.read_csv('Fake.csv', 
+                                 quotechar='"',
+                                 escapechar='\\',
+                                 encoding='utf-8',
+                                 on_bad_lines='skip')
+        except TypeError:
+            # Fallback for older pandas versions
+            fake_df = pd.read_csv('Fake.csv', 
+                                 quotechar='"',
+                                 encoding='utf-8',
+                                 error_bad_lines=False,
+                                 warn_bad_lines=False)
+    except Exception as e:
+        print(f"  Warning: Error reading Fake.csv: {e}")
+        print("  Trying basic reading method...")
+        fake_df = pd.read_csv('Fake.csv', encoding='utf-8')
+    
+    # Verify columns
+    print(f"  Columns found: {list(fake_df.columns)}")
+    if 'title' not in fake_df.columns or 'text' not in fake_df.columns:
+        print("  WARNING: Expected columns 'title' and 'text' not found!")
+        print("  Attempting to rename columns...")
+        # Try to fix column names if they're wrong
+        if len(fake_df.columns) >= 2:
+            fake_df.columns = ['title', 'text'] + list(fake_df.columns[2:])
+            print(f"  Renamed columns to: {list(fake_df.columns)}")
+    
+    fake_df['label'] = 0  # 0 for fake
+    print(f"  ✓ Loaded {len(fake_df)} fake news articles")
+    
+    # Load true news with proper CSV handling
+    print("Loading True.csv...")
+    try:
+        # Try with newer pandas syntax first
+        try:
+            true_df = pd.read_csv('True.csv',
+                                 quotechar='"',
+                                 escapechar='\\',
+                                 encoding='utf-8',
+                                 on_bad_lines='skip')
+        except TypeError:
+            # Fallback for older pandas versions
+            true_df = pd.read_csv('True.csv',
+                                 quotechar='"',
+                                 encoding='utf-8',
+                                 error_bad_lines=False,
+                                 warn_bad_lines=False)
+    except Exception as e:
+        print(f"  Warning: Error reading True.csv: {e}")
+        print("  Trying basic reading method...")
+        true_df = pd.read_csv('True.csv', encoding='utf-8')
+    
+    # Verify columns
+    print(f"  Columns found: {list(true_df.columns)}")
+    if 'title' not in true_df.columns or 'text' not in true_df.columns:
+        print("  WARNING: Expected columns 'title' and 'text' not found!")
+        print("  Attempting to rename columns...")
+        if len(true_df.columns) >= 2:
+            true_df.columns = ['title', 'text'] + list(true_df.columns[2:])
+            print(f"  Renamed columns to: {list(true_df.columns)}")
+    
+    true_df['label'] = 1  # 1 for real
+    print(f"  ✓ Loaded {len(true_df)} real news articles")
+    
+    # Combine datasets
+    print("Combining datasets...")
+    df = pd.concat([fake_df, true_df], ignore_index=True)
+    
+    # Shuffle the dataframe
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    print(f"\nTotal samples: {len(df)}")
+    print(f"  - Fake news: {len(df[df['label'] == 0])}")
+    print(f"  - Real news: {len(df[df['label'] == 1])}")
+    
+    # Final verification
+    print(f"\nFinal dataframe columns: {list(df.columns)}")
+    if 'title' not in df.columns or 'text' not in df.columns:
+        raise ValueError(f"CSV files must have 'title' and 'text' columns. Found: {list(df.columns)}")
+    
+    return df
+
+def preprocess_text(text):
+    """Clean and preprocess text data"""
+    if pd.isna(text) or text is None:
+        return ""
+    
+    # Convert to string
+    text = str(text)
+    
+    # Check if text is empty after conversion
+    if not text or text.strip() == '':
+        return ""
+    
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Remove URLs
+    text = re.sub(r'http\S+|www.\S+', '', text)
+    
+    # Remove email addresses
+    text = re.sub(r'\S+@\S+', '', text)
+    
+    # Remove special characters but keep letters, numbers, and basic punctuation
+    # This is less aggressive - keeps more content
+    text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+def combine_title_text(row):
+    """Combine title and text columns"""
+    # Get raw values first
+    title_raw = row.get('title', '')
+    text_raw = row.get('text', '')
+    
+    # Preprocess
+    title = preprocess_text(title_raw)
+    text = preprocess_text(text_raw)
+    
+    # If preprocessing removed everything, use original (less processed)
+    if not title and title_raw:
+        title = str(title_raw).lower().strip()[:200]  # Fallback: just lowercase and truncate
+    if not text and text_raw:
+        text = str(text_raw).lower().strip()[:500]  # Fallback: just lowercase and truncate
+    
+    # Combine with space, but handle empty strings
+    parts = [part for part in [title, text] if part and len(part.strip()) > 0]
+    combined = ' '.join(parts) if parts else ''
+    
+    return combined.strip()
+
+def prepare_data(df):
+    """Prepare text data for model training"""
+    print("\n" + "="*60)
+    print("STEP 2: Preprocessing text data...")
+    print("="*60)
+    
+    # Combine title and text
+    print("Combining title and text columns...")
+    
+    # Debug: Check if columns exist
+    if 'title' not in df.columns or 'text' not in df.columns:
+        print(f"ERROR: Required columns not found!")
+        print(f"Available columns: {list(df.columns)}")
+        raise ValueError(f"CSV must have 'title' and 'text' columns. Found: {list(df.columns)}")
+    
+    # Save original dataframe for debugging
+    df_original = df.copy()
+    initial_count = len(df)
+    
+    df['combined_text'] = df.apply(combine_title_text, axis=1)
+    
+    # Debug: Check sample combined texts
+    sample_lengths = df['combined_text'].str.len()
+    print(f"  Sample combined text lengths: min={sample_lengths.min()}, max={sample_lengths.max()}, mean={sample_lengths.mean():.1f}")
+    
+    # Remove empty texts (check for both empty strings and very short texts)
+    # Keep texts that have at least 5 characters (reduced threshold)
+    df_filtered = df[df['combined_text'].str.len() > 5]
+    removed = initial_count - len(df_filtered)
+    
+    if removed > 0:
+        print(f"  ✓ Removed {removed} empty or very short texts")
+    
+    if len(df_filtered) == 0:
+        print("\nERROR: All texts were removed during preprocessing!")
+        print("Checking sample data...")
+        try:
+            # Check the original dataframe before filtering
+            print(f"\nDataFrame columns: {list(df_original.columns)}")
+            print(f"DataFrame shape before filtering: {initial_count}")
+            
+            # Check a few sample rows from original
+            for idx in range(min(3, initial_count)):
+                row = df_original.iloc[idx]
+                print(f"\nSample row {idx}:")
+                print(f"  Title (raw): {str(row.get('title', 'N/A'))[:80]}")
+                print(f"  Text (raw): {str(row.get('text', 'N/A'))[:80]}")
+                combined_sample = combine_title_text(row)
+                print(f"  Combined length: {len(combined_sample)}")
+                print(f"  Combined preview: {combined_sample[:150] if len(combined_sample) > 0 else 'EMPTY'}")
+        except Exception as e:
+            print(f"Could not debug: {e}")
+            import traceback
+            traceback.print_exc()
+        raise ValueError("No valid texts found after preprocessing. Check your data format.")
+    
+    df = df_filtered
+    
+    # Get texts and labels
+    texts = df['combined_text'].values
+    labels = df['label'].values
+    
+    print(f"  ✓ Final dataset: {len(texts)} samples")
+    
+    return texts, labels
+
+def tokenize_and_pad(texts, tokenizer=None, fit=True):
+    """Tokenize and pad sequences"""
+    if fit:
+        print("\n" + "="*60)
+        print("STEP 3: Tokenizing and padding sequences...")
+        print("="*60)
+        tokenizer = Tokenizer(num_words=MAX_NB_WORDS, oov_token='<OOV>')
+        print("Fitting tokenizer on texts...")
+        tokenizer.fit_on_texts(texts)
+        vocab_size = len(tokenizer.word_index) + 1
+        print(f"  ✓ Vocabulary size: {vocab_size:,} words")
+    else:
+        print("Tokenizing texts...")
+    
+    print("Converting texts to sequences...")
+    sequences = tokenizer.texts_to_sequences(texts)
+    print(f"Padding sequences to length {MAX_SEQUENCE_LENGTH}...")
+    padded_sequences = pad_sequences(sequences, maxlen=MAX_SEQUENCE_LENGTH, padding='post', truncating='post')
+    print(f"  ✓ Created {len(padded_sequences)} sequences")
+    
+    return padded_sequences, tokenizer
+
+def build_lstm_model(vocab_size):
+    """Build LSTM-based model with very aggressive regularization"""
+    print("Building LSTM model with very strong regularization...")
+    
+    # Use even lower learning rate
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)  # Very low LR
+    
+    model = Sequential([
+        Embedding(
+            input_dim=vocab_size,
+            output_dim=EMBEDDING_DIM,
+            input_length=MAX_SEQUENCE_LENGTH,
+            mask_zero=True,
+            embeddings_regularizer=regularizers.l2(1e-4)  # Stronger regularization on embeddings
+        ),
+        GaussianNoise(0.1),  # Add input noise to prevent overfitting
+        SpatialDropout1D(0.5),  # Very high dropout
+        # Use single LSTM (not bidirectional) to reduce capacity
+        LSTM(
+            LSTM_UNITS,
+            return_sequences=False,
+            dropout=0.5,  # Very high dropout
+            recurrent_dropout=0.5,  # Very high recurrent dropout
+            kernel_regularizer=regularizers.l2(1e-3),  # Stronger L2
+            recurrent_regularizer=regularizers.l2(1e-3),
+            bias_regularizer=regularizers.l2(1e-3)
+        ),
+        Dropout(0.7),  # Extremely high dropout
+        Dense(
+            16,  # Very small dense layer
+            activation='relu',
+            kernel_regularizer=regularizers.l2(1e-2),  # Very strong L2
+            bias_regularizer=regularizers.l2(1e-2),
+            kernel_constraint=constraints.max_norm(3.0)  # Weight constraint
+        ),
+        Dropout(0.7),  # Another extremely high dropout
+        Dense(1, activation='sigmoid')
+    ])
+    
+    model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=['accuracy', AUC(name='auc'), 'precision', 'recall']
+    )
+    
+    return model
+
+def build_gru_model(vocab_size):
+    """Build GRU-based model with very aggressive regularization"""
+    print("Building GRU model with very strong regularization...")
+    
+    # Use even lower learning rate
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)  # Very low LR
+    
+    model = Sequential([
+        Embedding(
+            input_dim=vocab_size,
+            output_dim=EMBEDDING_DIM,
+            input_length=MAX_SEQUENCE_LENGTH,
+            mask_zero=True,
+            embeddings_regularizer=regularizers.l2(1e-4)  # Stronger regularization on embeddings
+        ),
+        GaussianNoise(0.1),  # Add input noise to prevent overfitting
+        SpatialDropout1D(0.5),  # Very high dropout
+        # Use single GRU (not bidirectional) to reduce capacity
+        GRU(
+            GRU_UNITS,
+            return_sequences=False,
+            dropout=0.5,  # Very high dropout
+            recurrent_dropout=0.5,  # Very high recurrent dropout
+            kernel_regularizer=regularizers.l2(1e-3),  # Stronger L2
+            recurrent_regularizer=regularizers.l2(1e-3),
+            bias_regularizer=regularizers.l2(1e-3)
+        ),
+        Dropout(0.7),  # Extremely high dropout
+        Dense(
+            16,  # Very small dense layer
+            activation='relu',
+            kernel_regularizer=regularizers.l2(1e-2),  # Very strong L2
+            bias_regularizer=regularizers.l2(1e-2),
+            kernel_constraint=constraints.max_norm(3.0)  # Weight constraint
+        ),
+        Dropout(0.7),  # Another extremely high dropout
+        Dense(1, activation='sigmoid')
+    ])
+    
+    model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=['accuracy', AUC(name='auc'), 'precision', 'recall']
+    )
+    
+    return model
+
+def build_cnn_model(vocab_size):
+    """Build simple CNN-based model (simpler architecture to reduce overfitting)"""
+    print("Building CNN model (simpler architecture)...")
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+    
+    model = Sequential([
+        Embedding(
+            input_dim=vocab_size,
+            output_dim=EMBEDDING_DIM,
+            input_length=MAX_SEQUENCE_LENGTH,
+            mask_zero=True,
+            embeddings_regularizer=regularizers.l2(1e-4)
+        ),
+        GaussianNoise(0.1),  # Input noise
+        SpatialDropout1D(0.5),
+        Conv1D(
+            filters=32,  # Small number of filters
+            kernel_size=3,
+            activation='relu',
+            kernel_regularizer=regularizers.l2(1e-3)
+        ),
+        MaxPooling1D(pool_size=2),
+        Dropout(0.6),
+        Conv1D(
+            filters=16,  # Even smaller
+            kernel_size=3,
+            activation='relu',
+            kernel_regularizer=regularizers.l2(1e-3)
+        ),
+        GlobalMaxPooling1D(),
+        Dropout(0.7),
+        Dense(
+            16,
+            activation='relu',
+            kernel_regularizer=regularizers.l2(1e-2),
+            kernel_constraint=constraints.max_norm(3.0)
+        ),
+        Dropout(0.7),
+        Dense(1, activation='sigmoid')
+    ])
+    
+    model.compile(
+        optimizer=optimizer,
+        loss='binary_crossentropy',
+        metrics=['accuracy', AUC(name='auc'), 'precision', 'recall']
+    )
+    
+    return model
+
+def plot_training_history(history):
+    """Plot training history"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Accuracy
+    axes[0, 0].plot(history.history['accuracy'], label='Train Accuracy')
+    axes[0, 0].plot(history.history['val_accuracy'], label='Val Accuracy')
+    axes[0, 0].set_title('Model Accuracy')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Accuracy')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+    
+    # Loss
+    axes[0, 1].plot(history.history['loss'], label='Train Loss')
+    axes[0, 1].plot(history.history['val_loss'], label='Val Loss')
+    axes[0, 1].set_title('Model Loss')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+    
+    # Precision
+    axes[1, 0].plot(history.history['precision'], label='Train Precision')
+    axes[1, 0].plot(history.history['val_precision'], label='Val Precision')
+    axes[1, 0].set_title('Model Precision')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Precision')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+    
+    # Recall
+    axes[1, 1].plot(history.history['recall'], label='Train Recall')
+    axes[1, 1].plot(history.history['val_recall'], label='Val Recall')
+    axes[1, 1].set_title('Model Recall')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Recall')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png', dpi=300, bbox_inches='tight')
+    print("Training history plot saved as 'training_history.png'")
+    plt.close()
+
+def plot_confusion_matrix(y_true, y_pred, model_name):
+    """Plot confusion matrix"""
+    cm = confusion_matrix(y_true, y_pred)
+    
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Fake', 'Real'], 
+                yticklabels=['Fake', 'Real'])
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.savefig(f'confusion_matrix_{model_name.lower()}.png', dpi=300, bbox_inches='tight')
+    print(f"Confusion matrix saved as 'confusion_matrix_{model_name.lower()}.png'")
+    plt.close()
+
+def evaluate_model(model, X_test, y_test, model_name):
+    """Evaluate model and print metrics"""
+    print(f"\n{'='*60}")
+    print(f"Evaluating {model_name} Model")
+    print(f"{'='*60}")
+    
+    # Predictions
+    y_pred_proba = model.predict(X_test, verbose=0)
+    y_pred = (y_pred_proba > 0.5).astype(int).flatten()
+    
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    
+    print(f"\nTest Set Metrics:")
+    print(f"Accuracy:  {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1-Score:  {f1:.4f}")
+    
+    print(f"\nClassification Report:")
+    print(classification_report(y_test, y_pred, target_names=['Fake', 'Real']))
+    
+    # Plot confusion matrix
+    plot_confusion_matrix(y_test, y_pred, model_name)
+    
+    return accuracy, precision, recall, f1
+
+def main():
+    """Main function to run the fake news detection pipeline"""
+    
+    # Load data
+    df = load_data()
+    
+    # Prepare data
+    texts, labels = prepare_data(df)
+    
+    # Split data: 80% train, 10% validation, 10% test
+    print("\n" + "="*60)
+    print("STEP 4: Splitting data (80/10/10)...")
+    print("="*60)
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        texts, labels, test_size=TEST_SPLIT, random_state=42, stratify=labels
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=VALIDATION_SPLIT/(1-TEST_SPLIT), random_state=42, stratify=y_temp
+    )
+    
+    # Apply data subset if enabled (anti-overfitting strategy)
+    if USE_DATA_SUBSET:
+        print(f"\nUsing data subset (anti-overfitting): {DATA_SUBSET_RATIO*100}% of training data")
+        subset_size = int(len(X_train) * DATA_SUBSET_RATIO)
+        indices = np.random.choice(len(X_train), subset_size, replace=False)
+        X_train = X_train[indices]
+        y_train = y_train[indices]
+        print(f"  ✓ Reduced training samples to: {len(X_train):,}")
+    
+    print(f"\nFinal split:")
+    print(f"  ✓ Training samples:   {len(X_train):,} ({int((1-VALIDATION_SPLIT-TEST_SPLIT)*100)}%)")
+    print(f"  ✓ Validation samples:  {len(X_val):,} ({int(VALIDATION_SPLIT*100)}%)")
+    print(f"  ✓ Test samples:        {len(X_test):,} ({int(TEST_SPLIT*100)}%)")
+    
+    # Tokenize and pad
+    X_train_padded, tokenizer = tokenize_and_pad(X_train, fit=True)
+    X_val_padded, _ = tokenize_and_pad(X_val, tokenizer=tokenizer, fit=False)
+    X_test_padded, _ = tokenize_and_pad(X_test, tokenizer=tokenizer, fit=False)
+    
+    vocab_size = len(tokenizer.word_index) + 1
+    print(f"\n  ✓ Final vocabulary size: {vocab_size:,}")
+    
+    # Save tokenizer
+    print("\nSaving tokenizer...")
+    with open('tokenizer.pkl', 'wb') as f:
+        pickle.dump(tokenizer, f)
+    print("  ✓ Tokenizer saved as 'tokenizer.pkl'")
+    
+    # Convert labels to numpy arrays
+    y_train = np.array(y_train)
+    y_val = np.array(y_val)
+    y_test = np.array(y_test)
+    
+    # Build and train LSTM model
+    print("\n" + "="*60)
+    print("STEP 5: Building and Training LSTM Model")
+    print("="*60)
+    
+    lstm_model = build_lstm_model(vocab_size)
+    print("\nModel Architecture:")
+    lstm_model.summary()
+    
+    # Callbacks with very aggressive early stopping to prevent overfitting
+    early_stopping = EarlyStopping(
+        monitor='val_auc',  # Monitor AUC
+        patience=3,  # Stop quickly if no improvement (prevent overfitting)
+        restore_best_weights=True,
+        verbose=1,
+        mode='max',
+        min_delta=0.001  # Minimum change to qualify as improvement
+    )
+    
+    model_checkpoint = ModelCheckpoint(
+        'best_lstm_model.h5',
+        monitor='val_auc',
+        save_best_only=True,
+        verbose=1,
+        mode='max'
+    )
+    
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_auc',
+        factor=0.3,  # More aggressive reduction
+        patience=2,  # Reduce LR quickly
+        min_lr=1e-7,  # Very low minimum LR
+        verbose=1,
+        mode='max'
+    )
+    
+    # Train LSTM model
+    print(f"\nStarting training...")
+    print(f"  - Batch size: {BATCH_SIZE}")
+    print(f"  - Max epochs: {EPOCHS}")
+    print(f"  - Early stopping: Enabled (patience=3)")
+    print(f"  - Learning rate reduction: Enabled")
+    # Check which device will be used
+    if len(tf.config.list_physical_devices('GPU')) > 0:
+        print(f"  - Device: GPU (will use automatically)\n")
+    else:
+        print(f"  - Device: CPU\n")
+    
+    history_lstm = lstm_model.fit(
+            X_train_padded, y_train,
+            batch_size=BATCH_SIZE,
+            epochs=EPOCHS,
+            validation_data=(X_val_padded, y_val),
+            callbacks=[early_stopping, model_checkpoint, reduce_lr],
+            verbose=1
+        )
+    
+    # Plot training history for LSTM
+    plot_training_history(history_lstm)
+    
+    # Evaluate LSTM model
+    lstm_model.load_weights('best_lstm_model.h5')
+    evaluate_model(lstm_model, X_test_padded, y_test, 'LSTM')
+    
+    # Build and train CNN model (simpler architecture)
+    print("\n" + "="*60)
+    print("STEP 6: Building and Training CNN Model (Simpler Architecture)")
+    print("="*60)
+    
+    cnn_model = build_cnn_model(vocab_size)
+    print("\nModel Architecture:")
+    cnn_model.summary()
+    
+    # Callbacks for CNN (same aggressive settings)
+    early_stopping_cnn = EarlyStopping(
+        monitor='val_auc',
+        patience=3,
+        restore_best_weights=True,
+        verbose=1,
+        mode='max',
+        min_delta=0.001
+    )
+    
+    model_checkpoint_cnn = ModelCheckpoint(
+        'best_cnn_model.h5',
+        monitor='val_auc',
+        save_best_only=True,
+        verbose=1,
+        mode='max'
+    )
+    
+    reduce_lr_cnn = ReduceLROnPlateau(
+        monitor='val_auc',
+        factor=0.3,
+        patience=2,
+        min_lr=1e-7,
+        verbose=1,
+        mode='max'
+    )
+    
+    # Train CNN model
+    print(f"\nStarting training...")
+    print(f"  - Batch size: {BATCH_SIZE}")
+    print(f"  - Max epochs: {EPOCHS}")
+    print(f"  - Early stopping: Enabled (patience=3)")
+    print(f"  - Learning rate reduction: Enabled")
+    print(f"  - Input noise: Enabled (GaussianNoise)")
+    print(f"  - Data subset: {'Enabled' if USE_DATA_SUBSET else 'Disabled'}")
+    
+    # Check which device will be used
+    if len(tf.config.list_physical_devices('GPU')) > 0:
+        print(f"  - Device: GPU (will use automatically)\n")
+    else:
+        print(f"  - Device: CPU\n")
+    
+    history_cnn = cnn_model.fit(
+        X_train_padded, y_train,
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,
+        validation_data=(X_val_padded, y_val),
+        callbacks=[early_stopping_cnn, model_checkpoint_cnn, reduce_lr_cnn],
+        verbose=1
+    )
+    
+    # Plot training history for CNN
+    plot_training_history(history_cnn)
+    
+    # Evaluate CNN model
+    cnn_model.load_weights('best_cnn_model.h5')
+    evaluate_model(cnn_model, X_test_padded, y_test, 'CNN')
+    
+    # Save final models
+    print("\n" + "="*60)
+    print("Saving models...")
+    print("="*60)
+    lstm_model.save('lstm_model_final.h5')
+    print("  ✓ LSTM model saved as 'lstm_model_final.h5'")
+    cnn_model.save('cnn_model_final.h5')
+    print("  ✓ CNN model saved as 'cnn_model_final.h5'")
+    
+    print("\n" + "="*60)
+    print("🎉 Training Complete! 🎉")
+    print("="*60)
+    print("\nGenerated files:")
+    print("  - best_lstm_model.h5")
+    print("  - best_cnn_model.h5")
+    print("  - lstm_model_final.h5")
+    print("  - cnn_model_final.h5")
+    print("  - tokenizer.pkl")
+    print("  - training_history.png")
+    print("  - confusion_matrix_lstm.png")
+    print("  - confusion_matrix_cnn.png")
+    print("\nAnti-overfitting features used:")
+    print(f"  - Data subset: {DATA_SUBSET_RATIO*100}% of training data" if USE_DATA_SUBSET else "  - Data subset: Disabled")
+    print("  - Input noise: GaussianNoise(0.1)")
+    print("  - Very high dropout: 0.5-0.7")
+    print("  - Strong L2 regularization: 1e-2 to 1e-4")
+    print("  - Weight constraints: max_norm(3.0)")
+    print("  - Small model size: 16 units")
+    print("  - Simple CNN architecture (instead of GRU)")
+
+if __name__ == "__main__":
+    main()
+
